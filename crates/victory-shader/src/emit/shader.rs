@@ -45,6 +45,35 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
+/// What a geometry shader declares (`dx.entryPoints` tag 1 and `PSV0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Geometry {
+    /// DXIL `InputPrimitive`: 1 point, 2 line, 3 triangle, 6 lineadj, 7 triadj.
+    pub input_primitive: u32,
+    /// Maximum vertices emitted per invocation (`<= 1024`).
+    pub max_vertices: u32,
+    /// Active output stream mask (bit 0 = stream 0).
+    pub stream_mask: u32,
+    /// DXIL `PrimitiveTopology`: 1 pointlist, 3 linestrip, 5 trianglestrip.
+    pub output_topology: u32,
+    /// GS instancing count (`>= 1`).
+    pub instances: u32,
+}
+
+impl Geometry {
+    /// Vertices per input primitive for `self.input_primitive`.
+    pub(crate) fn input_vertices(self) -> Option<u32> {
+        match self.input_primitive {
+            1 => Some(1),
+            2 => Some(2),
+            3 => Some(3),
+            6 => Some(4),
+            7 => Some(6),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -55,6 +84,8 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// A geometry shader.
+    pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -113,6 +144,7 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            geometry: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -456,6 +488,11 @@ impl Shader {
                     });
                 }
             }
+            // Geometry shaders serialize all 4 output streams interleaved
+            // (`DxilViewIdState::Serialize`): streams 1..3 have 0 outputs.
+            if self.geometry.is_some() {
+                view.extend([0, 0, 0]);
+            }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
             let arr = self.m.aggregate(arr, &elems);
@@ -476,14 +513,26 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
-        // Entry properties: shader flags (tag 0), thread-group size (4),
-        // wave size (11).
+        // Entry properties: shader flags (tag 0), GS state (1),
+        // thread-group size (4), mesh state (9), wave size (11).
         let mut props = Vec::new();
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
             let i64t = self.m.int(64);
             let f = self.m.int_const(i64t, self.flags as i64);
             props.push(self.m.md_value(f));
+        }
+        if let Some(gs) = self.geometry {
+            props.push(i32c(&mut self, 1));
+            let state = [
+                gs.input_primitive,
+                gs.max_vertices,
+                gs.stream_mask,
+                gs.output_topology,
+                gs.instances,
+            ]
+            .map(|n| Some(i32c(&mut self, n)));
+            props.push(self.m.md_node(state.to_vec()));
         }
         if let Some(threads) = self.threads {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
@@ -531,9 +580,10 @@ impl Shader {
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.geometry.is_some() => ("gs", 2u32),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
             (None, false) => ("vs", 1),
@@ -587,6 +637,7 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            geometry: self.geometry,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,

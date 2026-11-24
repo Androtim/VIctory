@@ -143,6 +143,8 @@ enum Op {
     AtomicRmw(Rmw, V, V),
     /// Pointer, expected, new; returns `{i32, i1}`.
     CmpXchg(V, V, V),
+    /// Local stack allocation of `ty` (address space 0): allocated type, array size.
+    Alloca(Ty, V),
 }
 
 #[derive(Debug, Clone)]
@@ -445,6 +447,13 @@ impl Module {
         let pair = self.ty(TypeDef::Struct(None, vec![i32t, i1]));
         let r = self.push(block, pair, Op::CmpXchg(ptr, expected, new));
         self.extract(block, r, 0)
+    }
+    /// Local stack allocation of one `ty` in address space 0 (must be emitted
+    /// in the entry block for DXIL).
+    pub fn alloca(&mut self, block: usize, ty: Ty) -> V {
+        let one = self.i32(1);
+        let ptr = self.ptr(ty);
+        self.push(block, ptr, Op::Alloca(ty, one))
     }
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
@@ -830,6 +839,18 @@ impl Module {
                     Op::CmpXchg(p, c, n) => {
                         w.record(46, &[rel(*p), rel(*c), rel(*n), 0, 6, 1, 6, 0]);
                     }
+                    // Explicit allocated type (bit 6), alignment 4 (log2 + 1 = 3).
+                    Op::Alloca(ty, size) => {
+                        w.record(
+                            19,
+                            &[
+                                u64::from(ty.0),
+                                u64::from(self.type_of(*size).0),
+                                u64::from(abs(*size)),
+                                3 | (1 << 6),
+                            ],
+                        );
+                    }
                 }
                 if !self.is_void(inst.ty) {
                     inst_id += 1;
@@ -867,7 +888,7 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*a);
             f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) | Op::Alloca(_, v) => f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             f(*a);
             f(*b);
@@ -1156,6 +1177,28 @@ mod tests {
         assert!(successors(Some(Term::Ret)).is_empty());
         assert_eq!(&*successors(Some(Term::Br(7))), &[7]);
         assert_eq!(&*successors(Some(Term::CondBr(V::Const(0), 3, 5))), &[3, 5]);
+    }
+
+    #[test]
+    fn alloca_emits_bitcode_with_element_load_store() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i32t = m.int(32);
+        let arr = m.array(8, i32t);
+        let main_ty = m.func_ty(void, vec![]);
+        m.ptr(main_ty);
+        m.function("main", main_ty, None, true);
+        let entry = m.new_block();
+        let buf = m.alloca(entry, arr);
+        let idx = m.i32(3);
+        let ptr = m.element(entry, buf, idx);
+        let val = m.i32(42);
+        m.store(entry, ptr, val);
+        let _loaded = m.load(entry, ptr);
+        m.terminate(entry, Term::Ret);
+        let bytes = m.write();
+        assert_eq!(&bytes[..4], b"BC\xC0\xDE");
+        assert_eq!(bytes.len() % 4, 0);
     }
 
     /// The written bytes are pinned to what the writer produced before the

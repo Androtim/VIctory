@@ -183,8 +183,8 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// Translates the vertex, pixel, compute, mesh or geometry program of a
+/// console shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
@@ -195,12 +195,12 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
             )
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or geometry program",
         })?;
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let res = resource::track(&p, &native.layout, native.stage)?;
@@ -266,6 +266,10 @@ pub fn emit(
         }
         _ => 0,
     };
+    let geometry = match &native.io {
+        crate::native::StageIo::Gs(_) => Some(gs_state(c)?),
+        _ => None,
+    };
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -276,6 +280,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        geometry,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -297,6 +302,47 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
     })
+}
+
+/// Geometry shader state from the container's `PSV0` runtime info (`PSVRuntimeInfo1`).
+fn gs_state(c: &Container) -> Result<shader::Geometry, ShaderError> {
+    use crate::dxbc::u32_at;
+    let psv = c
+        .part(FourCC::PSV0)
+        .ok_or(ShaderError::Malformed("geometry shader without PSV0"))?
+        .data;
+    let info_size = u32_at(psv, 0)? as usize;
+    if info_size < 36 || psv.len() < 4 + info_size {
+        return Err(ShaderError::Malformed("truncated geometry PSV0"));
+    }
+    let info = &psv[4..4 + info_size];
+    if info[24] != 2 {
+        return Err(ShaderError::Malformed("PSV0 stage is not geometry"));
+    }
+    let input_primitive = u32_at(info, 0)?;
+    let output_topology = u32_at(info, 4)?;
+    let stream_mask = u32_at(info, 8)?;
+    let max_vertices = u32::from(u16::from_le_bytes([info[26], info[27]]));
+    if !matches!(output_topology, 1 | 3 | 5) || max_vertices == 0 || max_vertices > 1024 {
+        return Err(ShaderError::Malformed("implausible geometry PSV0 state"));
+    }
+    if stream_mask != 1 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "geometry shader with multiple or inactive output streams",
+        });
+    }
+    let gs = shader::Geometry {
+        input_primitive,
+        max_vertices,
+        stream_mask,
+        output_topology,
+        instances: 1,
+    };
+    if gs.input_vertices().is_none() {
+        return Err(ShaderError::Malformed("unknown geometry input primitive"));
+    }
+    Ok(gs)
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -731,5 +777,230 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    fn geometry_shader_translates_merged_prologue_lds_and_sendmsg() {
+        // Synthetic wave64 merged ES+GS shader:
+        // - EXEC prologue from s3 (MergedWaveInfo): s_bfe_i32 + s_cmp_ge_u32
+        //   + s_bfm_b64 + s_cselect_b64 exec + s_cbranch_execz
+        // - Lane index via v_mbcnt_lo_u32_b32 / v_mbcnt_hi_u32_b32
+        // - ES-to-GS vertex input loads from v0 lo/hi via ds_read_b32 / ds_read_b64
+        // - Reads SV_PrimitiveID (v2) and SV_GSInstanceID (v3)
+        // - GSVS vertex writes via ds_write_b32 / ds_write_b64
+        // - s_barrier (elided in GS), three EMITs, one CUT, one EMIT_CUT, one GS_DONE
+        let vop3 = |op: u32, vdst: u32, s0: u32, s1: u32| -> [u32; 2] {
+            [0xD400_0000 | (op << 16) | vdst, s0 | (s1 << 9)]
+        };
+        let ds_r = |op: u32, vdst: u32, addr: u32, off: u32| -> [u32; 2] {
+            [0xD800_0000 | (op << 18) | (off & 0xFFFF), addr | (vdst << 24)]
+        };
+        let ds_w = |op: u32, addr: u32, data0: u32, off: u32| -> [u32; 2] {
+            [0xD800_0000 | (op << 18) | (off & 0xFFFF), addr | (data0 << 8)]
+        };
+        let mut words: Vec<u32> = Vec::new();
+        words.extend([
+            0x9400_FF03, // s_bfe_i32 s0, s3, 0x0008_0008
+            0x0008_0008,
+            0xBF09_C000, // s_cmp_ge_u32 s0, 64
+            0x9280_8000, // s_bfm_b64 s[0:1], s0, 0
+            0x85FE_00C1, // s_cselect_b64 exec, -1, s[0:1]
+        ]);
+        let branch_idx = words.len();
+        words.push(0xBF88_0000); // s_cbranch_execz -> end (patched below)
+        words.extend(vop3(0x365, 5, 193, 128)); // v_mbcnt_lo_u32_b32 v5, -1, 0
+        words.extend(vop3(0x366, 5, 193, 256 + 5)); // v_mbcnt_hi_u32_b32 v5, -1, v5
+        words.extend([
+            0x360C_00FF, // v_and_b32 v6, 0xffff, v0
+            0x0000_FFFF,
+            0x2C0E_0090, // v_lshrrev_b32 v7, 16, v0
+        ]);
+        words.extend(ds_r(0x36, 8, 6, 0)); // ds_read_b32 v8, v6 offset:0 (vtx0 pos.x)
+        words.extend(ds_r(0x76, 10, 7, 16)); // ds_read_b64 v[10:11], v7 offset:16 (vtx1 uv.xy)
+        words.extend([
+            0xBF8A_0000, // s_barrier (no-op in GS)
+        ]);
+        // Write vertex 0..2 outputs into lane 0's GSVS area (stride 32 B = 2 rows).
+        words.extend(ds_w(0x0D, 5, 8, 0)); // ds_write_b32 v5, v8 offset:0
+        words.extend(ds_w(0x4D, 5, 10, 16)); // ds_write_b64 v5, v[10:11] offset:16
+        words.extend(ds_w(0x0D, 5, 2, 32)); // ds_write_b32 v5, v2 offset:32 (SV_PrimitiveID)
+        words.extend(ds_w(0x0D, 5, 3, 64)); // ds_write_b32 v5, v3 offset:64 (SV_GSInstanceID)
+        words.extend([
+            0xBF90_0022, // s_sendmsg(MSG_GS, GS_OP_EMIT, 0)
+            0xBF90_0022, // s_sendmsg(MSG_GS, GS_OP_EMIT, 0)
+            0xBF90_0022, // s_sendmsg(MSG_GS, GS_OP_EMIT, 0)
+            0xBF90_0012, // s_sendmsg(MSG_GS, GS_OP_CUT, 0)
+            0xBF90_0032, // s_sendmsg(MSG_GS, GS_OP_EMIT_CUT, 0)
+            0xBF90_0003, // s_sendmsg(MSG_GS_DONE, GS_OP_NOP)
+        ]);
+        let end_idx = words.len();
+        words[branch_idx] = 0xBF88_0000 | ((end_idx - branch_idx - 1) as u32 & 0xFFFF);
+        words.push(0xBF81_0000); // s_endpgm
+
+        let native = super::NativeProgram {
+            stage: super::HwStage::Gs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Gs(crate::native::GeometryIo { lds_bytes: 4096 }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let sig = |name: &str, kind: u8, row: u32, cols: u8| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: (1u8 << cols) - 1,
+            half: false,
+        };
+        let ins = [sig("SV_Position", 3, 0, 4), sig("TEXCOORD", 0, 1, 2)];
+        let outs = [sig("SV_Position", 3, 0, 4), sig("TEXCOORD", 0, 1, 2)];
+        let isg1 = super::container::signature(&ins, true);
+        let osg1 = super::container::signature(&outs, false);
+        let gs = super::shader::Geometry {
+            input_primitive: 3, // Triangle
+            max_vertices: 6,
+            stream_mask: 1,
+            output_topology: 5, // TriangleStrip
+            instances: 1,
+        };
+        let psv0_in = super::container::psv(&super::container::Psv {
+            stage: 2,
+            flag: true,
+            inputs: &ins,
+            outputs: &outs,
+            prims: &[],
+            mesh: None,
+            geometry: Some(gs),
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        let container_bytes = crate::dxbc::build(&[
+            (super::FourCC::ISG1, &isg1),
+            (super::FourCC::OSG1, &osg1),
+            (super::FourCC::PSV0, &psv0_in),
+        ]);
+        let c = super::Container::parse(&container_bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(out.stage, super::HwStage::Gs);
+
+        // dxil.dll, where there is one, checks PSV0 and bitcode.
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+
+        let host = super::Container::parse(&out.dxil).unwrap();
+        let dxil = crate::DxilProgram::parse(host.part(super::FourCC::DXIL).unwrap().data).unwrap();
+        assert_eq!(dxil.kind, crate::ShaderKind::Geometry);
+        assert_eq!(dxil.shader_model, (6, 6));
+
+        let sfi0 = u64::from_le_bytes(
+            host.part(super::FourCC::SFI0).unwrap().data.try_into().unwrap(),
+        );
+        assert_eq!(sfi0 & 0x8000, 0, "no INT64 needed for GS prologue");
+
+        let psv = host.part(super::FourCC::PSV0).unwrap().data;
+        let info = &psv[4..4 + 48];
+        assert_eq!(u32::from_le_bytes(info[0..4].try_into().unwrap()), 3); // Triangle
+        assert_eq!(u32::from_le_bytes(info[4..8].try_into().unwrap()), 5); // TriangleStrip
+        assert_eq!(u32::from_le_bytes(info[8..12].try_into().unwrap()), 1); // stream 0
+        assert_eq!(info[12], 1); // OutputPositionPresent
+        assert_eq!(info[24], 2); // ShaderStage::Geometry
+        assert_eq!(u16::from_le_bytes(info[26..28].try_into().unwrap()), 6); // MaxVertexCount
+        assert_eq!(info[31], 2); // SigInputVectors
+        assert_eq!(&info[32..36], &[2, 0, 0, 0]); // SigOutputVectors[0..4]
+    }
+
+    #[test]
+    fn geometry_shader_rejects_unsupported_cases() {
+        let make = |words: &[u32], stream_mask: u32| {
+            let native = super::NativeProgram {
+                stage: super::HwStage::Gs,
+                wave64: true,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Gs(crate::native::GeometryIo { lds_bytes: 256 }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let pos = SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            };
+            let isg1 = super::container::signature(std::slice::from_ref(&pos), true);
+            let osg1 = super::container::signature(std::slice::from_ref(&pos), false);
+            let gs = super::shader::Geometry {
+                input_primitive: 3,
+                max_vertices: 3,
+                stream_mask,
+                output_topology: 5,
+                instances: 1,
+            };
+            let psv0 = super::container::psv(&super::container::Psv {
+                stage: 2,
+                flag: true,
+                inputs: std::slice::from_ref(&pos),
+                outputs: std::slice::from_ref(&pos),
+                prims: &[],
+                mesh: None,
+                geometry: Some(gs),
+                bindings: &[],
+                threads: [0; 3],
+                wave_size: None,
+            });
+            let bytes = crate::dxbc::build(&[
+                (super::FourCC::ISG1, &isg1),
+                (super::FourCC::OSG1, &osg1),
+                (super::FourCC::PSV0, &psv0),
+            ]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res)
+        };
+
+        // Multi-stream PSV0 is rejected.
+        assert!(make(&[0xBF81_0000], 0b11).is_err());
+        // Non-zero stream emit is rejected.
+        assert!(make(&[0xBF90_0122, 0xBF81_0000], 1).is_err());
+        // LDS atomic in GS is rejected (ds_add_u32 v0, v1).
+        assert!(make(&[0xD800_0000, 0x0000_0100, 0xBF81_0000], 1).is_err());
+        // Cross-lane v_mbcnt with non-all-ones mask (v_mbcnt_lo_u32_b32 v5, s0, 0; ds_write_b32 v5, v5).
+        assert!(
+            make(
+                &[
+                    0xD765_0005,
+                    0x0001_0000, // v_mbcnt_lo_u32_b32 v5, s0, 0
+                    0xD834_0000,
+                    0x0000_0505, // ds_write_b32 v5, v5
+                    0xBF81_0000,
+                ],
+                1,
+            )
+            .is_err()
+        );
     }
 }

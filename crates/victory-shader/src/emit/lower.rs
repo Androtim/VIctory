@@ -50,6 +50,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Geometry: primitive types, stream mask, max vertex count.
+    pub geometry: Option<super::shader::Geometry>,
 }
 
 enum Stop {
@@ -77,7 +79,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
-/// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
+/// `s_sendmsg` ids for geometry and mesh stages.
+const MSG_GS: u16 = 2;
+const MSG_GS_DONE: u16 = 3;
 const GS_ALLOC_REQ: u16 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +220,29 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Geometry: per-invocation input/output local memory and emitted count.
+    gs: Option<GsMemory>,
+}
+
+/// Per-invocation local memory of a lowered geometry shader (`HwStage::Gs`):
+/// - `in_buf` holds the input primitive's attributes (`dx.op.loadInput`) at
+///   synthetic byte offsets `[in_base .. in_base + in_dwords * 4)` handed out
+///   through `v0`/`v1`/`v4`.
+/// - `out_buf` holds the lane's GSVS output area (vertex `k` at dwords
+///   `[k * vertex_dwords .. (k + 1) * vertex_dwords)`), written by `ds_write*`
+///   and copied into `dx.op.storeOutput` on `s_sendmsg(MSG_GS, EMIT/EMIT_CUT)`.
+/// - `emitted` counts vertices emitted so far (`alloca i32`).
+#[derive(Debug, Clone, Copy)]
+struct GsMemory {
+    in_buf: Option<V>,
+    in_base: u32,
+    in_stride: u32,
+    in_dwords: u32,
+    out_buf: Option<V>,
+    out_dwords: u32,
+    vertex_dwords: u32,
+    emitted: V,
+    input_vertices: u32,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -443,6 +470,12 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        if let Some(gs) = x.geometry {
+            s.geometry = Some(gs);
+            // DXIL geometry shaders have no thread-group shared memory or
+            // barriers; ES-to-GS synchronization is handled by the host pipeline.
+            no_barrier.extend(0..p.blocks.len());
+        }
         Lower {
             s,
             x,
@@ -509,6 +542,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            gs: None,
         }
     }
 
@@ -842,6 +876,9 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        if let Some(gs) = self.s.geometry {
+            self.gs_prologue(gs).map_err(|w| unsupported(0, w))?;
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -958,7 +995,45 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::PrimitiveId if self.s.geometry.is_some() => {
+                let entry = self.s.entry;
+                return Val::I32(self.s.op(
+                    entry,
+                    "primitiveID.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    108,
+                    &[],
+                ));
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
+            Input::GsInstanceId => {
+                let entry = self.s.entry;
+                return Val::I32(self.s.op(
+                    entry,
+                    "gsInstanceID.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    100,
+                    &[],
+                ));
+            }
+            Input::GsWaveOffset => return Val::I32(self.s.m.i32(0)),
+            Input::GsVertexOffset(pair) => {
+                let Some(gm) = self.gs else {
+                    return Val::I32(self.s.m.i32(0));
+                };
+                let lo_v = u32::from(pair) * 2;
+                let hi_v = lo_v + 1;
+                let off = |v: u32| {
+                    if gm.in_dwords > 0 && v < gm.input_vertices {
+                        (gm.in_base + v * gm.in_stride) & 0xFFFF
+                    } else {
+                        0
+                    }
+                };
+                return Val::I32(self.s.m.i32(off(lo_v) | (off(hi_v) << 16)));
+            }
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
@@ -971,6 +1046,11 @@ impl<'a> Lower<'a> {
                 };
                 let n = self.s.m.i32(self.x.mesh_stride);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Mul, g, n));
+            }
+            Input::MergedWaveInfo if self.s.geometry.is_some() => {
+                // One active GS primitive in this virtual wave (bits 15:8 = 1),
+                // running in lane 0.
+                return Val::I32(self.s.m.i32(1 << 8));
             }
             Input::MergedWaveInfo => {
                 // shortcut: only the wave index (bits 24-27) is set; the
@@ -1028,6 +1108,101 @@ impl<'a> Lower<'a> {
         self.load_input(id, col)
     }
 
+    /// Allocates per-invocation local arrays for a geometry shader's ES-to-GS
+    /// input vertices and GSVS output vertices, then populates the inputs via
+    /// `dx.op.loadInput`. All `alloca`s are emitted first in `self.s.entry`.
+    fn gs_prologue(&mut self, gs: super::shader::Geometry) -> Result<(), Why> {
+        let input_vertices = gs.input_vertices().ok_or("unknown geometry input primitive")?;
+        let in_rows = self
+            .s
+            .inputs
+            .iter()
+            .filter_map(|e| e.row)
+            .map(|r| r + 1)
+            .max()
+            .unwrap_or(0);
+        let out_rows = self
+            .s
+            .outputs
+            .iter()
+            .filter_map(|e| e.row)
+            .map(|r| r + 1)
+            .max()
+            .unwrap_or(0);
+        let in_stride = in_rows * 16;
+        let in_dwords = input_vertices * in_rows * 4;
+        let in_bytes = in_dwords * 4;
+        let in_base = if in_dwords > 0 {
+            0x1_0000u32.saturating_sub(in_bytes.next_multiple_of(64))
+        } else {
+            0
+        };
+        let vertex_dwords = out_rows * 4;
+        let out_dwords = gs.max_vertices.saturating_mul(vertex_dwords).min(4096);
+
+        let entry = self.s.entry;
+        let in_buf = (in_dwords > 0).then(|| {
+            let ty = self.s.m.array(in_dwords, self.s.t.i32);
+            self.s.m.alloca(entry, ty)
+        });
+        let out_buf = (out_dwords > 0).then(|| {
+            let ty = self.s.m.array(out_dwords, self.s.t.i32);
+            self.s.m.alloca(entry, ty)
+        });
+        let emitted = self.s.m.alloca(entry, self.s.t.i32);
+        let zero = self.s.m.i32(0);
+        self.s.m.store(entry, emitted, zero);
+
+        if let Some(in_buf) = in_buf {
+            let elems: Vec<(usize, u32, u8, u8, bool)> = self
+                .s
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(id, e)| Some((id, e.row?, e.col, e.cols, e.half)))
+                .collect();
+            for &(_, _, _, _, half) in &elems {
+                if half {
+                    return Err("a 16-bit geometry input");
+                }
+            }
+            for vtx in 0..input_vertices {
+                for &(id, row, col, cols, _) in &elems {
+                    for c in 0..cols {
+                        let Val::I32(word) = self.load_any_input_vertex(id, c, Some(vtx)) else {
+                            unreachable!()
+                        };
+                        let slot = vtx * in_rows * 4 + row * 4 + u32::from(col + c);
+                        let idx = self.s.m.i32(slot);
+                        let ptr = self.s.m.element(entry, in_buf, idx);
+                        self.s.m.store(entry, ptr, word);
+                    }
+                }
+            }
+        }
+        self.gs = Some(GsMemory {
+            in_buf,
+            in_base,
+            in_stride,
+            in_dwords,
+            out_buf,
+            out_dwords,
+            vertex_dwords,
+            emitted,
+            input_vertices,
+        });
+        Ok(())
+    }
+
+    /// Unsigned clamp of `idx` to `[0, len - 1]`.
+    fn clamp_index(&mut self, idx: V, len: u32) -> V {
+        let c = self.cur;
+        let limit = self.s.m.i32(len);
+        let last = self.s.m.i32(len.saturating_sub(1));
+        let ok = self.s.m.cmp(c, pred::IULT, idx, limit);
+        self.s.m.select(c, ok, idx, last)
+    }
+
     /// A component of a compute thread or group id, read in the entry block.
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
@@ -1058,6 +1233,10 @@ impl<'a> Lower<'a> {
 
     /// An input element's channel as declared (16-bit ones as 32-bit floats).
     fn load_any_input(&mut self, id: usize, col: u8) -> Val {
+        self.load_any_input_vertex(id, col, None)
+    }
+
+    fn load_any_input_vertex(&mut self, id: usize, col: u8, vertex: Option<u32>) -> Val {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let (int, bit) = (e.comp != 9, e.comp == 1);
@@ -1076,11 +1255,15 @@ impl<'a> Lower<'a> {
             ".f32"
         };
         let entry = self.s.entry;
+        let vtx = match vertex {
+            Some(v) => self.s.m.i32(v),
+            None => self.s.m.undef(self.s.t.i32),
+        };
         let args = [
             self.s.m.i32(id as u32),
             self.s.m.i32(0),
             self.s.m.i8(col),
-            self.s.m.undef(self.s.t.i32),
+            vtx,
         ];
         let v = self.s.op(
             entry,
@@ -1616,6 +1799,17 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
+            Atom::Opaque(v) if self.s.geometry.is_some() => {
+                // A geometry invocation is lane 0 of its own virtual wave
+                // (e.g. the merged ES+GS EXEC prologue mask).
+                let Val::I32(lo) = self.get(v)? else {
+                    return Err("an opaque lane mask");
+                };
+                let (one, z) = (self.s.m.i32(1), self.s.m.i32(0));
+                let bit = self.s.m.bin(at, Bin::And, lo, one);
+                Ok(self.s.m.cmp(at, pred::NE, bit, z))
+            }
+            Atom::Constant(k) if self.s.geometry.is_some() => Ok(self.s.m.bool(k & 1 != 0)),
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
@@ -2104,7 +2298,7 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
-        if self.s.lds_dwords == 0 {
+        if self.gs.is_none() && self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
@@ -2147,8 +2341,12 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
+                    let x = if let Some(gm) = self.gs {
+                        self.gs_ds_read(gm, a, off + 4 * k)
+                    } else {
+                        let p = dword(self, off + 4 * k);
+                        self.s.m.load(self.cur, p)
+                    };
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -2172,11 +2370,18 @@ impl<'a> Lower<'a> {
             }
             let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
-                self.s.m.store(self.cur, p, x);
+                if let Some(gm) = self.gs {
+                    self.gs_ds_write(gm, a, off, x);
+                } else {
+                    let p = dword(self, off);
+                    self.s.m.store(self.cur, p, x);
+                }
             }
             self.end_guarded(at, &[]);
             return Ok(());
+        }
+        if self.gs.is_some() {
+            return Err("an LDS atomic in a geometry shader");
         }
         // Atomics: the old value returns with `_rtn`.
         let op = name
@@ -2225,6 +2430,141 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Reads one dword from a geometry shader's synthetic per-invocation LDS
+    /// (`in_buf` at `[in_base ..)` for ES-to-GS inputs, `out_buf` below it).
+    fn gs_ds_read(&mut self, gm: GsMemory, base_addr: V, bytes: u32) -> V {
+        let c = self.cur;
+        let off = self.s.m.i32(bytes);
+        let at = self.s.m.bin(c, Bin::Add, base_addr, off);
+        let two = self.s.m.i32(2);
+        let read_in = |l: &mut Self, in_buf: V| {
+            let base = l.s.m.i32(gm.in_base);
+            let rel = l.s.m.bin(l.cur, Bin::Sub, at, base);
+            let idx = l.s.m.bin(l.cur, Bin::LShr, rel, two);
+            let idx = l.clamp_index(idx, gm.in_dwords);
+            let p = l.s.m.element(l.cur, in_buf, idx);
+            l.s.m.load(l.cur, p)
+        };
+        let read_out = |l: &mut Self, out_buf: V| {
+            let idx = l.s.m.bin(l.cur, Bin::LShr, at, two);
+            let idx = l.clamp_index(idx, gm.out_dwords);
+            let p = l.s.m.element(l.cur, out_buf, idx);
+            l.s.m.load(l.cur, p)
+        };
+        match (gm.in_buf, gm.out_buf) {
+            (Some(in_buf), Some(out_buf)) => {
+                let base = self.s.m.i32(gm.in_base);
+                let is_in = self.s.m.cmp(self.cur, pred::IUGE, at, base);
+                let iv = read_in(self, in_buf);
+                let ov = read_out(self, out_buf);
+                self.s.m.select(self.cur, is_in, iv, ov)
+            }
+            (Some(in_buf), None) => read_in(self, in_buf),
+            (None, Some(out_buf)) => read_out(self, out_buf),
+            (None, None) => self.s.m.i32(0),
+        }
+    }
+
+    /// Writes one dword to a geometry shader's GSVS output `alloca`, dropping
+    /// out-of-bounds writes.
+    fn gs_ds_write(&mut self, gm: GsMemory, base_addr: V, bytes: u32, val: V) {
+        let Some(out_buf) = gm.out_buf else {
+            return;
+        };
+        let c = self.cur;
+        let off = self.s.m.i32(bytes);
+        let at = self.s.m.bin(c, Bin::Add, base_addr, off);
+        let two = self.s.m.i32(2);
+        let idx = self.s.m.bin(c, Bin::LShr, at, two);
+        let limit = self.s.m.i32(gm.out_dwords);
+        let ok = self.s.m.cmp(c, pred::IULT, idx, limit);
+        let inner = self.begin_guarded(Some(ok));
+        let p = self.s.m.element(self.cur, out_buf, idx);
+        self.s.m.store(self.cur, p, val);
+        self.end_guarded(inner, &[]);
+    }
+
+    /// Lowers `s_sendmsg(MSG_GS | MSG_GS_DONE, op, stream)`: on `EMIT` or
+    /// `EMIT_CUT`, copies vertex `k` from `gs_out` to `dx.op.storeOutput` and
+    /// calls `dx.op.emitStream` / `dx.op.emitThenCutStream`; on `CUT`, calls
+    /// `dx.op.cutStream`.
+    fn gs_sendmsg(&mut self, b: usize, i: usize, imm: u16) -> Result<(), Why> {
+        let Some(gm) = self.gs else {
+            return Ok(());
+        };
+        let (msg, op, stream) = (imm & 0xF, imm >> 4 & 7, imm >> 8 & 3);
+        if !matches!(msg, MSG_GS | MSG_GS_DONE) || op == 0 {
+            return Ok(());
+        }
+        if op > 3 {
+            return Err("an unknown GS sendmsg op");
+        }
+        if stream != 0 {
+            return Err("geometry shader output to a non-zero stream");
+        }
+        let guard = self.guard(b, i)?;
+        let at = self.begin_guarded(guard);
+        if op == 2 || op == 3 {
+            let k = self.s.m.load(self.cur, gm.emitted);
+            if let Some(out_buf) = gm.out_buf {
+                let stride = self.s.m.i32(gm.vertex_dwords);
+                let base = self.s.m.bin(self.cur, Bin::Mul, k, stride);
+                for id in 0..self.s.outputs.len() {
+                    let (row, col, cols, comp) = {
+                        let e = &self.s.outputs[id];
+                        (e.row, e.col, e.cols, e.comp)
+                    };
+                    let Some(row) = row else {
+                        continue;
+                    };
+                    for c in 0..cols {
+                        self.s.outputs[id].usage |= 1 << c;
+                        let off = self.s.m.i32(row * 4 + u32::from(col + c));
+                        let idx = self.s.m.bin(self.cur, Bin::Add, base, off);
+                        let idx = self.clamp_index(idx, gm.out_dwords);
+                        let ptr = self.s.m.element(self.cur, out_buf, idx);
+                        let raw = self.s.m.load(self.cur, ptr);
+                        let (suffix, val) = if comp == 9 {
+                            (".f32", self.as_float(raw))
+                        } else {
+                            (".i32", raw)
+                        };
+                        let args = [
+                            self.s.m.i32(id as u32),
+                            self.s.m.i32(0),
+                            self.s.m.i8(c),
+                            val,
+                        ];
+                        let void = self.s.t.void;
+                        self.s.op(
+                            self.cur,
+                            &format!("storeOutput{suffix}"),
+                            Attr::NoUnwind,
+                            void,
+                            5,
+                            &args,
+                        );
+                    }
+                }
+            }
+            let one = self.s.m.i32(1);
+            let next = self.s.m.bin(self.cur, Bin::Add, k, one);
+            self.s.m.store(self.cur, gm.emitted, next);
+        }
+        let s0 = self.s.m.i8(stream as u8);
+        let void = self.s.t.void;
+        let (dx_name, dx_op) = match op {
+            1 => ("cutStream", 98),
+            2 => ("emitStream", 97),
+            3 => ("emitThenCutStream", 99),
+            _ => unreachable!(),
+        };
+        self.s
+            .op(self.cur, dx_name, Attr::NoUnwind, void, dx_op, &[s0]);
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
@@ -2249,6 +2589,7 @@ impl<'a> Lower<'a> {
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
+            || (name == "s_sendmsg" && self.s.geometry.is_some())
             || matches!(inst.fields, Fields::Ds { .. })
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
@@ -2266,6 +2607,9 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
+            }
+            Fields::Sopp { imm } if name == "s_sendmsg" && self.s.geometry.is_some() => {
+                self.gs_sendmsg(b, i, *imm)
             }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
@@ -2536,6 +2880,43 @@ impl<'a> Lower<'a> {
                         let r = self.s.m.select(c, cond, a, b);
                         self.set(v, Val::I32(r));
                     }
+                    Ok(())
+                }
+                "s_bfm_b64" => {
+                    let w = src32(self, 0)?;
+                    let o = src32(self, 1)?;
+                    let (z, one, k31, k32, k63, ones) = (
+                        self.s.m.i32(0),
+                        self.s.m.i32(1),
+                        self.s.m.i32(31),
+                        self.s.m.i32(32),
+                        self.s.m.i32(63),
+                        self.s.m.i32(u32::MAX),
+                    );
+                    let w = self.s.m.bin(c, Bin::And, w, k63);
+                    let o = self.s.m.bin(c, Bin::And, o, k63);
+                    // Unshifted 64-bit mask: (1u64 << w) - 1.
+                    let w_lo = self.s.m.bin(c, Bin::And, w, k31);
+                    let sh = self.s.m.bin(c, Bin::Shl, one, w_lo);
+                    let m_part = self.s.m.bin(c, Bin::Sub, sh, one);
+                    let w_ge32 = self.s.m.cmp(c, pred::IUGE, w, k32);
+                    let m_lo = self.s.m.select(c, w_ge32, ones, m_part);
+                    let m_hi = self.s.m.select(c, w_ge32, m_part, z);
+                    // Shift left by o (0..63), keeping shift counts in 0..31.
+                    let o_lo = self.s.m.bin(c, Bin::And, o, k31);
+                    let o_ge32 = self.s.m.cmp(c, pred::IUGE, o, k32);
+                    let o_zero = self.s.m.cmp(c, pred::EQ, o, z);
+                    let lo_sh = self.s.m.bin(c, Bin::Shl, m_lo, o_lo);
+                    let hi_sh = self.s.m.bin(c, Bin::Shl, m_hi, o_lo);
+                    let inv = self.s.m.bin(c, Bin::Sub, k32, o_lo);
+                    let inv = self.s.m.bin(c, Bin::And, inv, k31);
+                    let carry = self.s.m.bin(c, Bin::LShr, m_lo, inv);
+                    let carry = self.s.m.select(c, o_zero, z, carry);
+                    let hi_mid = self.s.m.bin(c, Bin::Or, hi_sh, carry);
+                    let rl = self.s.m.select(c, o_ge32, z, lo_sh);
+                    let rh = self.s.m.select(c, o_ge32, lo_sh, hi_mid);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
                     Ok(())
                 }
                 _ => Err(name),
@@ -5039,6 +5420,21 @@ impl<'a> Lower<'a> {
                 // Bits of the mask's low (high) half below this lane, plus src1:
                 // with an all-ones mask, the lane index.
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
+                if self.s.geometry.is_some() {
+                    // A geometry invocation is lane 0 of its own virtual wave,
+                    // so an all-ones mask has 0 active bits below it.
+                    let Fields::Valu(v) = &inst.fields else {
+                        unreachable!()
+                    };
+                    let all_ones = matches!(
+                        v.src.first(),
+                        Some(Operand::Const(193) | Operand::Literal(u32::MAX))
+                    );
+                    if !all_ones {
+                        return Err("cross-lane v_mbcnt in a geometry shader");
+                    }
+                    return Ok(b);
+                }
                 // Mesh lanes are the console's by construction; pixel and
                 // vertex lanes are the host's, as their masks are.
                 if self.mask_data == MaskData::Host {
@@ -6771,6 +7167,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         })
         .map(|_| ())
     }
@@ -6805,6 +7202,56 @@ mod tests {
         for words in [add, sub] {
             lowers(&words).unwrap();
         }
+    }
+
+    #[test]
+    fn s_bfm_b64_lowers_without_int64() {
+        // s_mov_b32 s0, 5; s_mov_b32 s1, 30; s_bfm_b64 s[2:3], s0, s1;
+        // s_or_b32 s4, s2, s3; s_cmp_lg_u32 s4, 0; s_cbranch_scc1 +1;
+        // s_mov_b32 s5, 0; s_endpgm
+        let words = [
+            0xBE80_0385u32, // s_mov_b32 s0, 5
+            0xBE81_039E,    // s_mov_b32 s1, 30
+            0x9282_0100,    // s_bfm_b64 s[2:3], s0, s1
+            0x8784_0302,    // s_or_b32 s4, s2, s3
+            0xBF07_8004,    // s_cmp_lg_u32 s4, 0
+            0xBF85_0001,    // s_cbranch_scc1 -> s_endpgm
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 8).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let out = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            geometry: None,
+        })
+        .unwrap();
+        let c = crate::Container::parse(&out.dxil).unwrap();
+        let sfi0 = u64::from_le_bytes(c.part(crate::FourCC::SFI0).unwrap().data.try_into().unwrap());
+        assert_eq!(sfi0 & 0x8000, 0, "s_bfm_b64 must not require INT64");
     }
 
 
@@ -6865,6 +7312,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         }).unwrap();
 
         let container =

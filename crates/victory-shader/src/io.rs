@@ -68,8 +68,15 @@ pub enum Input {
     GroupInfo,
     /// Mesh: v5, the group id times the group size (read as uniform).
     MeshGroup,
-    /// Mesh: s3, the wave's index in the group in bits 24-27.
+    /// Mesh / merged GS: s3, wave counts and wave index in the group.
     MergedWaveInfo,
+    /// Merged GS: v0/v1/v4, packed 16-bit LDS offsets for vertex pair
+    /// `(2*n, 2*n + 1)` of the input primitive.
+    GsVertexOffset(u8),
+    /// Merged GS: v3, `SV_GSInstanceID`.
+    GsInstanceId,
+    /// Merged GS: s2, `gs2vs_offset`.
+    GsWaveOffset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +264,22 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 (Reg::S(3), Input::MergedWaveInfo),
             ];
             (loaded, &[][..], &ms.outputs[..])
+        }
+        (StageIo::Gs(_), HwStage::Gs) => {
+            // GFX10 merged ES+GS hardware ABI: s2 gs2vs_offset, s3
+            // merged_wave_info (bits 15:8 = GS primitive count), v0/v1/v4
+            // packed 16-bit input vertex LDS offsets, v2 SV_PrimitiveID,
+            // v3 SV_GSInstanceID.
+            let loaded = vec![
+                (Reg::S(2), Input::GsWaveOffset),
+                (Reg::S(3), Input::MergedWaveInfo),
+                (Reg::V(0), Input::GsVertexOffset(0)),
+                (Reg::V(1), Input::GsVertexOffset(1)),
+                (Reg::V(2), Input::PrimitiveId),
+                (Reg::V(3), Input::GsInstanceId),
+                (Reg::V(4), Input::GsVertexOffset(2)),
+            ];
+            (loaded, &[][..], &[][..])
         }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
@@ -669,6 +692,46 @@ mod tests {
         assert_eq!(io.exports[0].target, Target::Primitive);
         // The group input is uniform only as the first lane reads it.
         assert!(mesh(&[0x7E02_0305, S_ENDPGM]).is_err()); // v_mov_b32 v1, v5
+    }
+
+    #[test]
+    fn geometry_inputs_follow_merged_abi() {
+        // Read s2, s3, v0, v1, v2, v3, v4 so all merged ES+GS system inputs
+        // appear in the IR input list.
+        let words = [
+            0xBE84_0302u32, // s_mov_b32 s4, s2
+            0xBE85_0303,    // s_mov_b32 s5, s3
+            0x7E0A_0300,    // v_mov_b32 v5, v0
+            0x7E0C_0301,    // v_mov_b32 v6, v1
+            0x7E0E_0302,    // v_mov_b32 v7, v2
+            0x7E10_0303,    // v_mov_b32 v8, v3
+            0x7E12_0304,    // v_mov_b32 v9, v4
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 16).unwrap();
+        let native = NativeProgram {
+            stage: HwStage::Gs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Gs(crate::native::GeometryIo { lds_bytes: 4096 }),
+            code,
+        };
+        let io = raise(&p, &native).unwrap();
+        let kinds: Vec<Input> = io.inputs.iter().map(|i| i.1).collect();
+        for expected in [
+            Input::GsWaveOffset,
+            Input::MergedWaveInfo,
+            Input::GsVertexOffset(0),
+            Input::GsVertexOffset(1),
+            Input::PrimitiveId,
+            Input::GsInstanceId,
+            Input::GsVertexOffset(2),
+        ] {
+            assert!(kinds.contains(&expected), "missing {expected:?} in {kinds:?}");
+        }
     }
 
     #[test]

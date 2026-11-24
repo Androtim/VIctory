@@ -268,6 +268,15 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    Gs(GeometryIo),
+}
+
+/// A merged geometry stage's record metadata (`HwStage::Gs`). Its input and
+/// output signatures and topology limits live in the container's `ISG1`,
+/// `OSG1`, and `PSV0` parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeometryIo {
+    pub lds_bytes: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -538,6 +547,9 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            HwStage::Gs => StageIo::Gs(GeometryIo {
+                lds_bytes: u32_at(record, RECORD_LDS)?,
+            }),
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -936,6 +948,17 @@ mod tests {
                 lds_bytes: 16,
             })
         );
+    }
+
+    #[test]
+    fn reads_geometry_lds_size() {
+        let mut blob = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Gs);
+        let record = e - RECORD_SIZE as usize;
+        blob[record + RECORD_LDS..][..4].copy_from_slice(&4096u32.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert_eq!(p.stage, HwStage::Gs);
+        assert_eq!(p.io, StageIo::Gs(GeometryIo { lds_bytes: 4096 }));
     }
 
     #[test]
